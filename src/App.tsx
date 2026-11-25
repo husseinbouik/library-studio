@@ -20,6 +20,15 @@ import {
   type LibraryState,
 } from './lib/design';
 
+/**
+ * Embed mode (?embed=1): render ONLY the 3D scene — no title chip, no
+ * control panel, no readouts — for the portfolio card's playable frame.
+ * Orbit + divider dragging stay active; the case fills the frame.
+ */
+const EMBED =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('embed') === '1';
+
 const REPO_URL = 'https://github.com/husseinbouik/library-studio';
 const ZONING_URL = 'https://husseinbouik.github.io/zoning-studio/';
 const LINKEDIN_URL = 'https://www.linkedin.com/in/hussein-bouik';
@@ -93,6 +102,7 @@ export default function App() {
             state={state}
             layout={layout}
             finish={finish}
+            embed={EMBED}
             onSelectBay={(i) => patch({ ...state, selectedBay: i })}
             onInteract={() => setInteracted(true)}
             onDragStart={() => {
@@ -111,6 +121,8 @@ export default function App() {
         )}
       </div>
 
+      {!EMBED && (
+        <>
       {/* Title chip */}
       <header className="title-chip">
         <h1>The Library</h1>
@@ -163,6 +175,8 @@ export default function App() {
         onFinish={(id) => patch({ ...state, finishId: id })}
         />
       </div>
+        </>
+      )}
     </div>
   );
 }

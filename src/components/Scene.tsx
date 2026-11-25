@@ -21,24 +21,78 @@ const T = PANEL_MM / 1000;
 const MAX_BOOKS = 1800;
 
 /**
- * Stage framing per aspect: on portrait screens the control panel
- * covers the lower half, and on landscape screens it sits bottom-centre —
- * either way the bookcase is lifted and the camera aimed low so the
- * whole case plays in the free area above the panel.
+ * Framing: the bookcase is the hero of the frame. The camera fits the
+ * case's projected extents into the FREE area of the screen — the full
+ * width, minus the title chip at the top and the bottom control stack —
+ * with the orbit target at the case's centre. The panel offset is
+ * applied as a camera view offset, so orbiting still pivots around the
+ * case itself. Distance is driven by the current total width, so a
+ * 360 cm case still fits whole and a 180 cm case comes closer.
  */
-function stageFor(aspect: number): { stageY: number; targetY: number; factor: number } {
-  if (aspect < 0.75) return { stageY: 0.34, targetY: 0.62, factor: 1.18 };
-  if (aspect < 1.05) return { stageY: 0.16, targetY: 0.72, factor: 1.3 };
-  if (aspect < 1.7) return { stageY: 0.12, targetY: 0.6, factor: 1.32 };
-  // Very short wide screens (landscape phones, social-card frames):
-  // pull back so the whole case still reads above the panel.
-  return { stageY: 0.1, targetY: 0.5, factor: 1.6 };
+const VIEW_DIR = new THREE.Vector3(0.42, 0.3, 1).normalize();
+const CASE_CENTER_Y = H / 2;
+const VFOV_RAD = THREE.MathUtils.degToRad(40);
+
+/** World-space width/height of the case as projected from VIEW_DIR. */
+function projectedExtents(widthMm: number): { projW: number; projH: number } {
+  const widthM = widthMm / 1000;
+  const az = Math.atan2(VIEW_DIR.x, VIEW_DIR.z);
+  const el = Math.atan2(VIEW_DIR.y, Math.hypot(VIEW_DIR.x, VIEW_DIR.z));
+  return {
+    projW: widthM * Math.cos(az) + D * Math.sin(az),
+    projH: H * Math.cos(el) + D * Math.sin(el),
+  };
+}
+
+/** Pixels reserved at the top so the title chip never covers the case. */
+function topReservePx(aspect: number): number {
+  if (aspect < 0.75) return 96;
+  if (aspect < 1.05) return 48;
+  return 16;
+}
+
+interface FreeArea {
+  /** Free height as a fraction of the canvas height — the NDC half-height the case may occupy. */
+  freeFrac: number;
+  /** Pixels the rendered image must shift up so the case centres in the free area. */
+  shiftPx: number;
+}
+
+function freeArea(size: { width: number; height: number }): FreeArea {
+  const aspect = size.width / Math.max(1, size.height);
+  const top = topReservePx(aspect);
+  let bottom: number;
+  const stack =
+    typeof document !== 'undefined' ? document.querySelector('.bottom-stack') : null;
+  if (stack) {
+    bottom = Math.max(0, size.height - stack.getBoundingClientRect().top);
+  } else if (aspect < 0.75) {
+    bottom = size.height * 0.52;
+  } else if (aspect < 1.05) {
+    bottom = size.height * 0.44;
+  } else {
+    bottom = size.height * 0.38;
+  }
+  const freePx = Math.max(120, size.height - top - bottom);
+  return { freeFrac: freePx / size.height, shiftPx: (bottom - top) / 2 };
+}
+
+/** Distance at which the whole case fits the free area and ≤97% of the width. */
+function fitDistance(widthMm: number, aspect: number, freeFrac: number): number {
+  const { projW, projH } = projectedExtents(widthMm);
+  const tanV = Math.tan(VFOV_RAD / 2);
+  const tanH = tanV * aspect;
+  const dH = projH / 2 / (tanV * freeFrac);
+  const dW = projW / 2 / (tanH * 0.97);
+  return Math.max(dH, dW) * 1.05;
 }
 
 interface SceneProps {
   state: LibraryState;
   layout: LibraryLayout;
   finish: Finish;
+  /** Embed mode (?embed=1): scene only — centred framing, no readouts. */
+  embed?: boolean;
   onSelectBay: (index: number) => void;
   onInteract: () => void;
   onDragStart: () => void;
@@ -126,9 +180,6 @@ interface BookcaseProps extends SceneProps {
 function Bookcase(props: BookcaseProps) {
   const { state, layout, onSelectBay, onInteract, onDragStart, onDragTo, onDragEnd } = props;
   const controls = useThree((s) => s.controls) as { enabled: boolean } | null;
-  const size = useThree((s) => s.size);
-  const aspect = size.width / Math.max(1, size.height);
-  const { stageY } = stageFor(aspect);
 
   const reducedMotion = useMemo(
     () =>
@@ -265,7 +316,7 @@ function Bookcase(props: BookcaseProps) {
   const shownAnimBay = shownDivider !== null ? a.bays[shownDivider] : undefined;
 
   return (
-    <group position={[0, stageY, 0]}>
+    <group>
       {/* Floor shadow catcher is ContactShadows (below); carcass: */}
       {/* Bottom + top panels */}
       <mesh position={[0, T / 2, 0]} material={props.woodMaterial} castShadow receiveShadow>
@@ -391,7 +442,7 @@ function Bookcase(props: BookcaseProps) {
             <span>‹</span>
             <span>›</span>
           </div>
-          {activeDivider !== null && shownBay && shownNext && (
+          {activeDivider !== null && shownBay && shownNext && !props.embed && (
             <div className="drag-label" aria-hidden="true">
               {fmtCm(shownBay.width)} · {fmtCm(shownNext.width)} cm
             </div>
@@ -406,9 +457,9 @@ function Bookcase(props: BookcaseProps) {
 
 /* ------------------------------------------------------------------ */
 
-/** Frame the bookcase on mount / width change, until the user orbits. */
-function CameraRig({ widthMm }: { widthMm: number }) {
-  const camera = useThree((s) => s.camera);
+/** Frame the bookcase: fit it into the free area, target at its centre. */
+function CameraRig({ widthMm, embed }: { widthMm: number; embed?: boolean }) {
+  const camera = useThree((s) => s.camera) as THREE.PerspectiveCamera;
   const controls = useThree((s) => s.controls) as unknown as {
     target: THREE.Vector3;
     update: () => void;
@@ -416,6 +467,7 @@ function CameraRig({ widthMm }: { widthMm: number }) {
   } | null;
   const size = useThree((s) => s.size);
   const userMoved = useRef(false);
+  const prevWidth = useRef(widthMm);
 
   useEffect(() => {
     if (!controls) return;
@@ -429,22 +481,45 @@ function CameraRig({ widthMm }: { widthMm: number }) {
     };
   }, [controls]);
 
+  // Shift the frustum so the case centres in the free area (below the
+  // title chip, above the control stack) while the orbit target stays
+  // at the case's centre.
   useEffect(() => {
-    if (userMoved.current || !controls) return;
+    // Embed mode: no chrome to clear — the case centres in the full frame.
+    if (embed) {
+      camera.clearViewOffset();
+      return;
+    }
+    const { shiftPx } = freeArea(size);
+    if (shiftPx > 0.5) {
+      camera.setViewOffset(size.width, size.height, 0, shiftPx, size.width, size.height);
+    } else {
+      camera.clearViewOffset();
+    }
+  }, [camera, size, embed]);
+
+  useEffect(() => {
+    if (!controls) return;
     const aspect = size.width / Math.max(1, size.height);
-    const { stageY, targetY, factor } = stageFor(aspect);
-    const widthM = widthMm / 1000;
-    const vfov = THREE.MathUtils.degToRad(40);
-    const hfov = 2 * Math.atan(Math.tan(vfov / 2) * aspect);
-    const fitW = widthM / 2 / Math.tan(hfov / 2);
-    const fitH =
-      Math.max(stageY + H - targetY, targetY - stageY) / Math.tan(vfov / 2);
-    const dist = THREE.MathUtils.clamp(Math.max(fitW, fitH) * factor + 0.5, 3.4, 12.5);
-    const dir = new THREE.Vector3(0.42, 0.3, 1).normalize();
-    camera.position.copy(dir.multiplyScalar(dist).add(new THREE.Vector3(0, targetY, 0)));
-    controls.target.set(0, targetY, 0);
-    controls.update();
-  }, [camera, controls, size, widthMm]);
+    const { freeFrac } = embed ? { freeFrac: 1 } : freeArea(size);
+    const dist = fitDistance(widthMm, aspect, freeFrac);
+    const widthChanged = prevWidth.current !== widthMm;
+    prevWidth.current = widthMm;
+    if (!userMoved.current) {
+      camera.position.copy(
+        VIEW_DIR.clone().multiplyScalar(dist).add(new THREE.Vector3(0, CASE_CENTER_Y, 0)),
+      );
+      controls.target.set(0, CASE_CENTER_Y, 0);
+      controls.update();
+    } else if (widthChanged) {
+      // Keep the user's angle; dolly so the resized case still fits whole.
+      const dir = camera.position.clone().sub(controls.target);
+      if (dir.length() > 0.001) {
+        camera.position.copy(controls.target).addScaledVector(dir.normalize(), dist);
+        controls.update();
+      }
+    }
+  }, [camera, controls, size, widthMm, embed]);
 
   return null;
 }
@@ -529,7 +604,7 @@ export default function Scene(props: SceneProps) {
         accentMaterial={accentMaterial}
         hitMaterial={hitMaterial}
       />
-      <CameraRig widthMm={props.state.widthMm} />
+      <CameraRig widthMm={props.state.widthMm} embed={props.embed} />
       <OrbitControls
         makeDefault
         enableDamping
